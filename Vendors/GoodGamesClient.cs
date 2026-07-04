@@ -15,15 +15,18 @@ internal static class GoodGamesClient
     };
 
     public static async Task<(Dictionary<string, CardResult> Results, Dictionary<string, int> NmPrices)> FetchAllAsync(
-        IReadOnlyList<string> cards)
+        IReadOnlyList<string> cards,
+        Action<VendorFetchProgress>? progress = null)
     {
         var results = new Dictionary<string, CardResult>();
         var nmPrices = new Dictionary<string, int>();
+        var completedCards = 0;
 
         foreach (var cardName in cards)
         {
             Console.Write($"  [GoodGames] Searching: {cardName}... ");
-            var (result, nmPrice) = await FetchCardAsync(cardName);
+            var (result, nmPrice, message, isVendorAccessProblem) = await FetchCardAsync(cardName);
+            completedCards++;
 
             if (result is not null)
             {
@@ -39,12 +42,26 @@ internal static class GoodGamesClient
             {
                 nmPrices[cardName.ToLowerInvariant()] = nmPrice.Value;
             }
+
+            progress?.Invoke(new VendorFetchProgress(
+                cardName,
+                result,
+                completedCards,
+                cards.Count,
+                message,
+                isVendorAccessProblem));
+
+            if (isVendorAccessProblem)
+            {
+                break;
+            }
         }
 
         return (results, nmPrices);
     }
 
-    private static async Task<(CardResult? Result, int? NmPrice)> FetchCardAsync(string cardName)
+    private static async Task<(CardResult? Result, int? NmPrice, string? Message, bool IsVendorAccessProblem)> FetchCardAsync(
+        string cardName)
     {
         var encoded = Uri.EscapeDataString(cardName.Replace(",", "", StringComparison.Ordinal));
         var url = "https://tcg.goodgames.com.au/search?q=" + encoded +
@@ -59,13 +76,34 @@ internal static class GoodGamesClient
         {
             using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
             using var response = await Http.SendAsync(request, cts.Token);
+            if (VendorAccessIssue.IsLikelyBlocked(response.StatusCode))
+            {
+                var message = VendorAccessIssue.MessageFor("Good Games");
+                Console.Write($"ERROR — {message} ");
+                return (null, null, message, true);
+            }
+
             response.EnsureSuccessStatusCode();
             html = await response.Content.ReadAsStringAsync(cts.Token);
         }
         catch (Exception ex)
         {
+            if (VendorAccessIssue.IsLikelyBlocked(ex))
+            {
+                var message = VendorAccessIssue.MessageFor("Good Games");
+                Console.Write($"ERROR — {message} ");
+                return (null, null, message, true);
+            }
+
             Console.Write($"ERROR — {ex.Message} ");
-            return (null, null);
+            return (null, null, null, false);
+        }
+
+        if (VendorAccessIssue.IsLikelyBlocked(html))
+        {
+            var message = VendorAccessIssue.MessageFor("Good Games");
+            Console.Write($"ERROR — {message} ");
+            return (null, null, message, true);
         }
 
         var pattern = new Regex(
@@ -150,6 +188,6 @@ internal static class GoodGamesClient
             }
         }
 
-        return (best, bestNm);
+        return (best, bestNm, null, false);
     }
 }

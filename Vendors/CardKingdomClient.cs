@@ -15,17 +15,31 @@ internal static class CardKingdomClient
         "G",
     };
 
-    public static async Task<Dictionary<string, CardResult>> FetchAllAsync(IReadOnlyList<string> cards)
+    public static async Task<Dictionary<string, CardResult>> FetchAllAsync(
+        IReadOnlyList<string> cards,
+        Action<VendorFetchProgress>? progress = null)
     {
         Console.Write($"  [CardKingdom] Fetching {cards.Count} cards (bulk)... ");
 
         var audRate = await GetAudRateAsync();
-        using var data = await FetchAsync(cards);
-        if (data is null)
+        var fetchResult = await FetchAsync(cards);
+        if (fetchResult.Data is null)
         {
+            if (fetchResult.IsVendorAccessProblem)
+            {
+                progress?.Invoke(new VendorFetchProgress(
+                    null,
+                    null,
+                    0,
+                    cards.Count,
+                    fetchResult.Message,
+                    true));
+            }
+
             return new Dictionary<string, CardResult>();
         }
 
+        using var data = fetchResult.Data;
         var results = Parse(data.RootElement, audRate);
         Console.WriteLine($"✓  ({results.Count} found)");
         return results;
@@ -59,7 +73,7 @@ internal static class CardKingdomClient
         }
     }
 
-    private static async Task<JsonDocument?> FetchAsync(IReadOnlyList<string> cards)
+    private static async Task<JsonFetchResult> FetchAsync(IReadOnlyList<string> cards)
     {
         var cardData = string.Join("\r\n", cards.Select(name => $"1 {name}"));
         var payload = JsonSerializer.Serialize(new Dictionary<string, object>
@@ -82,14 +96,37 @@ internal static class CardKingdomClient
         try
         {
             using var response = await Http.SendAsync(request);
+            if (VendorAccessIssue.IsLikelyBlocked(response.StatusCode))
+            {
+                var message = VendorAccessIssue.MessageFor("Card Kingdom");
+                Console.WriteLine($"\n  [CardKingdom] Request failed: {message}");
+                return new JsonFetchResult(null, message, true);
+            }
+
             response.EnsureSuccessStatusCode();
             await using var stream = await response.Content.ReadAsStreamAsync();
-            return await JsonDocument.ParseAsync(stream);
+            var data = await JsonDocument.ParseAsync(stream);
+            if (VendorAccessIssue.IsLikelyBlocked(data.RootElement.GetRawText()))
+            {
+                var message = VendorAccessIssue.MessageFor("Card Kingdom");
+                Console.WriteLine($"\n  [CardKingdom] Request failed: {message}");
+                data.Dispose();
+                return new JsonFetchResult(null, message, true);
+            }
+
+            return new JsonFetchResult(data, null, false);
         }
         catch (Exception ex)
         {
+            if (VendorAccessIssue.IsLikelyBlocked(ex))
+            {
+                var message = VendorAccessIssue.MessageFor("Card Kingdom");
+                Console.WriteLine($"\n  [CardKingdom] Request failed: {message}");
+                return new JsonFetchResult(null, message, true);
+            }
+
             Console.WriteLine($"\n  [CardKingdom] Request failed: {ex.Message}");
-            return null;
+            return new JsonFetchResult(null, null, false);
         }
     }
 
@@ -245,4 +282,9 @@ internal static class CardKingdomClient
             _ => null,
         };
     }
+
+    private sealed record JsonFetchResult(
+        JsonDocument? Data,
+        string? Message,
+        bool IsVendorAccessProblem);
 }

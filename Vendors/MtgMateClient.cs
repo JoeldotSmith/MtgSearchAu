@@ -16,13 +16,20 @@ internal static class MtgMateClient
         "damaged foil",
     };
 
-    public static async Task<Dictionary<string, CardResult>> FetchAllAsync(IReadOnlyList<string> cards)
+    public static async Task<Dictionary<string, CardResult>> FetchAllAsync(
+        IReadOnlyList<string> cards,
+        Action<VendorFetchProgress>? progress = null)
     {
         Console.Write($"  [MTGMate] Fetching {cards.Count} cards (bulk)... ");
 
-        var html = await FetchHtmlAsync(cards);
+        var (html, message, isVendorAccessProblem) = await FetchHtmlAsync(cards);
         if (html is null)
         {
+            if (isVendorAccessProblem)
+            {
+                progress?.Invoke(new VendorFetchProgress(null, null, 0, cards.Count, message, true));
+            }
+
             return new Dictionary<string, CardResult>();
         }
 
@@ -31,7 +38,8 @@ internal static class MtgMateClient
         return results;
     }
 
-    private static async Task<string?> FetchHtmlAsync(IReadOnlyList<string> cards)
+    private static async Task<(string? Html, string? Message, bool IsVendorAccessProblem)> FetchHtmlAsync(
+        IReadOnlyList<string> cards)
     {
         var decklist = string.Join("\n", cards.Select(name => $"1 {name}"));
         var parameters = FormEncode(
@@ -50,13 +58,35 @@ internal static class MtgMateClient
         try
         {
             using var response = await Http.SendAsync(request);
+            if (VendorAccessIssue.IsLikelyBlocked(response.StatusCode))
+            {
+                var message = VendorAccessIssue.MessageFor("MTGMate");
+                Console.WriteLine($"\n  [MTGMate] Request failed: {message}");
+                return (null, message, true);
+            }
+
             response.EnsureSuccessStatusCode();
-            return await response.Content.ReadAsStringAsync();
+            var html = await response.Content.ReadAsStringAsync();
+            if (VendorAccessIssue.IsLikelyBlocked(html))
+            {
+                var message = VendorAccessIssue.MessageFor("MTGMate");
+                Console.WriteLine($"\n  [MTGMate] Request failed: {message}");
+                return (null, message, true);
+            }
+
+            return (html, null, false);
         }
         catch (Exception ex)
         {
+            if (VendorAccessIssue.IsLikelyBlocked(ex))
+            {
+                var message = VendorAccessIssue.MessageFor("MTGMate");
+                Console.WriteLine($"\n  [MTGMate] Request failed: {message}");
+                return (null, message, true);
+            }
+
             Console.WriteLine($"\n  [MTGMate] Request failed: {ex.Message}");
-            return null;
+            return (null, null, false);
         }
     }
 

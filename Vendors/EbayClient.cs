@@ -36,7 +36,9 @@ internal static class EbayClient
     private static string? s_token;
     private static DateTimeOffset s_expiresAt;
 
-    public static async Task<Dictionary<string, CardResult>> FetchAllAsync(IReadOnlyList<string> cards)
+    public static async Task<Dictionary<string, CardResult>> FetchAllAsync(
+        IReadOnlyList<string> cards,
+        Action<VendorFetchProgress>? progress = null)
     {
         var results = new Dictionary<string, CardResult>();
         string token;
@@ -47,13 +49,27 @@ internal static class EbayClient
         catch (Exception ex)
         {
             Console.WriteLine($"[eBay] Could not get access token — {ex.Message}");
+            if (VendorAccessIssue.IsLikelyBlocked(ex))
+            {
+                progress?.Invoke(new VendorFetchProgress(
+                    null,
+                    null,
+                    0,
+                    cards.Count,
+                    VendorAccessIssue.MessageFor("eBay"),
+                    true));
+            }
+
             return results;
         }
 
+        var completedCards = 0;
         foreach (var cardName in cards)
         {
             Console.Write($"  [eBay] Searching: {cardName}... ");
-            var result = await FetchCardAsync(cardName, token);
+            var (result, message, isVendorAccessProblem) = await FetchCardAsync(cardName, token);
+            completedCards++;
+
             if (result is not null)
             {
                 results[cardName.ToLowerInvariant()] = result;
@@ -62,6 +78,19 @@ internal static class EbayClient
             else
             {
                 Console.WriteLine("not found");
+            }
+
+            progress?.Invoke(new VendorFetchProgress(
+                cardName,
+                result,
+                completedCards,
+                cards.Count,
+                message,
+                isVendorAccessProblem));
+
+            if (isVendorAccessProblem)
+            {
+                break;
             }
         }
 
@@ -190,7 +219,10 @@ internal static class EbayClient
         return values.FirstOrDefault(value => !string.IsNullOrWhiteSpace(value));
     }
 
-    private static async Task<CardResult?> FetchCardAsync(string cardName, string token, bool retried = false)
+    private static async Task<(CardResult? Result, string? Message, bool IsVendorAccessProblem)> FetchCardAsync(
+        string cardName,
+        string token,
+        bool retried = false)
     {
         var query = FormEncode(
             ("q", $"{cardName} mtg"),
@@ -217,8 +249,15 @@ internal static class EbayClient
 
             if (!response.IsSuccessStatusCode)
             {
+                if (VendorAccessIssue.IsLikelyBlocked(response.StatusCode))
+                {
+                    var message = VendorAccessIssue.MessageFor("eBay");
+                    Console.Write($"ERROR — {message} ");
+                    return (null, message, true);
+                }
+
                 Console.Write($"ERROR — HTTP {(int)response.StatusCode} ");
-                return null;
+                return (null, null, false);
             }
 
             await using var stream = await response.Content.ReadAsStreamAsync();
@@ -226,8 +265,15 @@ internal static class EbayClient
         }
         catch (Exception ex)
         {
+            if (VendorAccessIssue.IsLikelyBlocked(ex))
+            {
+                var message = VendorAccessIssue.MessageFor("eBay");
+                Console.Write($"ERROR — {message} ");
+                return (null, message, true);
+            }
+
             Console.Write($"ERROR — {ex.Message} ");
-            return null;
+            return (null, null, false);
         }
 
         using (data)
@@ -236,7 +282,7 @@ internal static class EbayClient
                 items.ValueKind != JsonValueKind.Array ||
                 items.GetArrayLength() == 0)
             {
-                return null;
+                return (null, null, false);
             }
 
             var nameKey = cardName.ToLowerInvariant().Split(',')[0].Trim();
@@ -308,7 +354,7 @@ internal static class EbayClient
                 }
             }
 
-            return best;
+            return (best, null, false);
         }
     }
 

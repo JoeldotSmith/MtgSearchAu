@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Globalization;
 using System.Text.RegularExpressions;
 using MtgPriceSearch.Vendors;
@@ -59,29 +60,31 @@ public sealed class MtgSearchService
             return new MtgSearchResponse([], [], [], [], activeVendors, []);
         }
 
-        var ckResults = ignoredVendorCodes.Contains("ck")
-            ? EmptyResults()
-            : await CardKingdomClient.FetchAllAsync(cards);
+        var vendorAccessProblems = new ConcurrentDictionary<string, string>(StringComparer.Ordinal);
 
-        Dictionary<string, CardResult> ggResults;
-        Dictionary<string, int> ggNm;
-        if (ignoredVendorCodes.Contains("gg"))
-        {
-            ggResults = EmptyResults();
-            ggNm = new Dictionary<string, int>(StringComparer.Ordinal);
-        }
-        else
-        {
-            (ggResults, ggNm) = await GoodGamesClient.FetchAllAsync(cards);
-        }
+        var ckTask = ignoredVendorCodes.Contains("ck")
+            ? Task.FromResult(EmptyResults())
+            : FetchBulkVendorAsync("ck", () => CardKingdomClient.FetchAllAsync(cards, CreateVendorProgress("ck")));
 
-        var mmResults = ignoredVendorCodes.Contains("mm")
-            ? EmptyResults()
-            : await MtgMateClient.FetchAllAsync(cards);
+        var ggTask = ignoredVendorCodes.Contains("gg")
+            ? Task.FromResult<(Dictionary<string, CardResult> Results, Dictionary<string, int> NmPrices)>(
+                (EmptyResults(), new Dictionary<string, int>(StringComparer.Ordinal)))
+            : FetchGoodGamesAsync();
 
-        var ebayResults = ignoredVendorCodes.Contains("ebay")
-            ? EmptyResults()
-            : await EbayClient.FetchAllAsync(cards);
+        var mmTask = ignoredVendorCodes.Contains("mm")
+            ? Task.FromResult(EmptyResults())
+            : FetchBulkVendorAsync("mm", () => MtgMateClient.FetchAllAsync(cards, CreateVendorProgress("mm")));
+
+        var ebayTask = ignoredVendorCodes.Contains("ebay")
+            ? Task.FromResult(EmptyResults())
+            : FetchCardByCardVendorAsync("ebay", () => EbayClient.FetchAllAsync(cards, CreateVendorProgress("ebay")));
+
+        await Task.WhenAll(ckTask, ggTask, mmTask, ebayTask);
+
+        var ckResults = await ckTask;
+        var (ggResults, ggNm) = await ggTask;
+        var mmResults = await mmTask;
+        var ebayResults = await ebayTask;
 
         var ignoredVendorNames = ignoredVendorCodes
             .Select(code => VendorAliases[code])
@@ -114,6 +117,141 @@ public sealed class MtgSearchService
 
         var orders = BuildOptimizedOrders(cards, vendorResults, excluded, request.ReturnCount);
         return new MtgSearchResponse(cards, mainRows, filteredRows, notFound, activeVendors, orders);
+
+        async Task<Dictionary<string, CardResult>> FetchBulkVendorAsync(
+            string vendorCode,
+            Func<Task<Dictionary<string, CardResult>>> fetch)
+        {
+            ReportVendorStatus(vendorCode, $"Fetching {cards.Count} cards", 0, cards.Count);
+            var results = await fetch();
+            if (vendorAccessProblems.ContainsKey(vendorCode))
+            {
+                ReportVendorStatus(
+                    vendorCode,
+                    "Temporarily blocked; skipped this vendor",
+                    cards.Count,
+                    cards.Count,
+                    isVendorAccessProblem: true);
+                return results;
+            }
+
+            ReportBulkVendorResults(vendorCode, cards, results);
+            ReportVendorStatus(vendorCode, "Complete", cards.Count, cards.Count);
+            return results;
+        }
+
+        async Task<(Dictionary<string, CardResult> Results, Dictionary<string, int> NmPrices)> FetchGoodGamesAsync()
+        {
+            ReportVendorStatus("gg", $"Searching {cards.Count} cards", 0, cards.Count);
+            var results = await GoodGamesClient.FetchAllAsync(cards, CreateVendorProgress("gg"));
+            ReportVendorStatus(
+                "gg",
+                vendorAccessProblems.ContainsKey("gg")
+                    ? "Temporarily blocked; skipped remaining cards"
+                    : "Complete",
+                cards.Count,
+                cards.Count,
+                vendorAccessProblems.ContainsKey("gg"));
+            return results;
+        }
+
+        async Task<Dictionary<string, CardResult>> FetchCardByCardVendorAsync(
+            string vendorCode,
+            Func<Task<Dictionary<string, CardResult>>> fetch)
+        {
+            ReportVendorStatus(vendorCode, $"Searching {cards.Count} cards", 0, cards.Count);
+            var results = await fetch();
+            ReportVendorStatus(
+                vendorCode,
+                vendorAccessProblems.ContainsKey(vendorCode)
+                    ? "Temporarily blocked; skipped remaining cards"
+                    : "Complete",
+                cards.Count,
+                cards.Count,
+                vendorAccessProblems.ContainsKey(vendorCode));
+            return results;
+        }
+
+        Action<VendorFetchProgress>? CreateVendorProgress(string vendorCode)
+        {
+            return request.Progress is null
+                ? null
+                : progress => ReportVendorProgress(vendorCode, progress);
+        }
+
+        void ReportBulkVendorResults(
+            string vendorCode,
+            IReadOnlyList<string> vendorCards,
+            IReadOnlyDictionary<string, CardResult> results)
+        {
+            var completedCards = 0;
+            foreach (var cardName in vendorCards)
+            {
+                completedCards++;
+                results.TryGetValue(cardName.ToLowerInvariant(), out var result);
+                ReportVendorProgress(
+                    vendorCode,
+                    new VendorFetchProgress(cardName, result, completedCards, vendorCards.Count));
+            }
+        }
+
+        void ReportVendorProgress(string vendorCode, VendorFetchProgress progress)
+        {
+            if (request.Progress is null)
+            {
+                return;
+            }
+
+            var vendorKey = VendorAliases[vendorCode];
+            var result = progress.Result;
+            var message = progress.Message ?? (result is null ? "Not found" : "Found");
+            if (progress.IsVendorAccessProblem)
+            {
+                vendorAccessProblems[vendorCode] = message;
+            }
+
+            request.Progress.Report(new MtgSearchProgressUpdate(
+                vendorKey,
+                VendorDisplayNames[vendorKey],
+                progress.CardName,
+                message,
+                progress.CompletedCards,
+                progress.TotalCards,
+                result is not null,
+                result is null ? null : FormatMoney(result.PriceCents),
+                result?.SetName,
+                result?.Condition,
+                result?.Url,
+                progress.IsVendorAccessProblem));
+        }
+
+        void ReportVendorStatus(
+            string vendorCode,
+            string message,
+            int completedCards,
+            int totalCards,
+            bool isVendorAccessProblem = false)
+        {
+            if (request.Progress is null)
+            {
+                return;
+            }
+
+            var vendorKey = VendorAliases[vendorCode];
+            request.Progress.Report(new MtgSearchProgressUpdate(
+                vendorKey,
+                VendorDisplayNames[vendorKey],
+                null,
+                message,
+                completedCards,
+                totalCards,
+                false,
+                null,
+                null,
+                null,
+                null,
+                isVendorAccessProblem));
+        }
     }
 
     public static IReadOnlyList<string> ParseDecklist(string decklist)
@@ -454,7 +592,22 @@ public sealed record MtgSearchRequest(IReadOnlyList<string> Cards)
     public double? FilterDiff { get; init; }
     public int ReturnCount { get; init; } = 1;
     public IReadOnlySet<string> IgnoreVendors { get; init; } = new HashSet<string>(StringComparer.Ordinal);
+    public IProgress<MtgSearchProgressUpdate>? Progress { get; init; }
 }
+
+public sealed record MtgSearchProgressUpdate(
+    string VendorKey,
+    string VendorName,
+    string? CardName,
+    string Message,
+    int CompletedCards,
+    int TotalCards,
+    bool IsFound,
+    string? PriceString,
+    string? Set,
+    string? Condition,
+    string? Url,
+    bool IsVendorAccessProblem);
 
 public sealed record MtgSearchResponse(
     IReadOnlyList<string> Cards,
