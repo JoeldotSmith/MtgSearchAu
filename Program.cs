@@ -123,7 +123,7 @@ internal static class Program
             }
         }
 
-        OptimiseOrder(cards, vendorResults, excluded);
+        OptimiseOrder(cards, vendorResults, excluded, options.ReturnCount);
         return 0;
     }
 
@@ -288,7 +288,8 @@ internal static class Program
     private static void OptimiseOrder(
         IReadOnlyList<string> cards,
         IReadOnlyDictionary<string, Dictionary<string, CardResult>> vendorResults,
-        IReadOnlySet<string> excludedCards)
+        IReadOnlySet<string> excludedCards,
+        int returnCount)
     {
         var vendorNames = vendorResults.Keys.ToList();
         var activeCards = cards.Where(c => !excludedCards.Contains(c.ToLowerInvariant())).ToList();
@@ -297,7 +298,7 @@ internal static class Program
             .Select(c => c.ToLowerInvariant())
             .ToHashSet(StringComparer.Ordinal);
 
-        OrderSolution? bestSolution = null;
+        var solutions = new Dictionary<string, OrderSolution>(StringComparer.Ordinal);
 
         for (var size = 1; size <= vendorNames.Count; size++)
         {
@@ -334,78 +335,119 @@ internal static class Program
                 var postageTotal = vendorsUsed.Sum(v => Postage[v]);
                 var total = cardsTotal + postageTotal;
                 var coverage = config.Count;
+                var solution = new OrderSolution(coverage, total, config);
+                var signature = BuildSolutionSignature(config);
 
-                if (bestSolution is null ||
-                    coverage > bestSolution.Coverage ||
-                    (coverage == bestSolution.Coverage && total < bestSolution.TotalCost))
+                if (!solutions.TryGetValue(signature, out var existing) ||
+                    IsBetterOrderSolution(solution, existing))
                 {
-                    bestSolution = new OrderSolution(coverage, total, config);
+                    solutions[signature] = solution;
                 }
             }
         }
 
-        if (bestSolution is null)
+        var rankedSolutions = solutions.Values
+            .OrderByDescending(solution => solution.Coverage)
+            .ThenBy(solution => solution.TotalCost)
+            .ThenBy(solution => CountVendors(solution.Config))
+            .ThenBy(solution => BuildSolutionSignature(solution.Config), StringComparer.Ordinal)
+            .Take(returnCount)
+            .ToList();
+
+        if (rankedSolutions.Count == 0)
         {
             Console.WriteLine("\nNo cards could be sourced from any vendor.");
             return;
         }
 
-        var vendorCards = vendorNames.ToDictionary(v => v, _ => new List<string>(), StringComparer.Ordinal);
-        foreach (var (cardKey, vendor) in bestSolution.Config)
+        for (var index = 0; index < rankedSolutions.Count; index++)
         {
-            vendorCards[vendor].Add(cardKey);
-        }
-
-        var unsourceable = activeCards.Where(c => !bestSolution.Config.ContainsKey(c.ToLowerInvariant())).ToList();
-
-        Console.WriteLine("\n" + new string('═', 60));
-        Console.WriteLine($"  OPTIMAL ORDER  —  total incl. postage: {FormatMoney(bestSolution.TotalCost)}");
-        Console.WriteLine(new string('═', 60));
-
-        foreach (var vendor in vendorNames)
-        {
-            var cardList = vendorCards[vendor];
-            if (cardList.Count == 0)
+            var solution = rankedSolutions[index];
+            var vendorCards = vendorNames.ToDictionary(v => v, _ => new List<string>(), StringComparer.Ordinal);
+            foreach (var (cardKey, vendor) in solution.Config)
             {
-                continue;
+                vendorCards[vendor].Add(cardKey);
             }
 
-            var results = vendorResults[vendor];
-            var postage = Postage[vendor];
-            var cardsCost = cardList.Sum(cardKey => results[cardKey].PriceCents);
-            var orderTotal = cardsCost + postage;
-            var rows = cardList
-                .OrderBy(cardKey => results[cardKey].PriceCents)
-                .Select(cardKey =>
+            var unsourceable = activeCards.Where(c => !solution.Config.ContainsKey(c.ToLowerInvariant())).ToList();
+
+            Console.WriteLine("\n" + new string('═', 60));
+            if (rankedSolutions.Count == 1)
+            {
+                Console.WriteLine($"  OPTIMAL ORDER  —  total incl. postage: {FormatMoney(solution.TotalCost)}");
+            }
+            else
+            {
+                Console.WriteLine($"  OPTIMAL ORDER {index + 1}/{rankedSolutions.Count}  —  total incl. postage: {FormatMoney(solution.TotalCost)}");
+            }
+
+            Console.WriteLine(new string('═', 60));
+
+            foreach (var vendor in vendorNames)
+            {
+                var cardList = vendorCards[vendor];
+                if (cardList.Count == 0)
                 {
-                    var result = results[cardKey];
-                    return new[]
+                    continue;
+                }
+
+                var results = vendorResults[vendor];
+                var postage = Postage[vendor];
+                var cardsCost = cardList.Sum(cardKey => results[cardKey].PriceCents);
+                var orderTotal = cardsCost + postage;
+                var rows = cardList
+                    .OrderBy(cardKey => results[cardKey].PriceCents)
+                    .Select(cardKey =>
                     {
-                        result.CardName,
-                        result.SetName,
-                        result.Condition,
-                        result.Qty.ToString(CultureInfo.InvariantCulture),
-                        FormatMoney(result.PriceCents),
-                    };
-                })
-                .ToList();
+                        var result = results[cardKey];
+                        return new[]
+                        {
+                            result.CardName,
+                            result.SetName,
+                            result.Condition,
+                            result.Qty.ToString(CultureInfo.InvariantCulture),
+                            FormatMoney(result.PriceCents),
+                        };
+                    })
+                    .ToList();
 
-            DrawOrderTable(
-                $"Order from {CultureInfo.InvariantCulture.TextInfo.ToTitleCase(vendor)}",
-                rows,
-                postage,
-                cardsCost,
-                orderTotal);
-        }
+                DrawOrderTable(
+                    $"Order from {CultureInfo.InvariantCulture.TextInfo.ToTitleCase(vendor)}",
+                    rows,
+                    postage,
+                    cardsCost,
+                    orderTotal);
+            }
 
-        if (unsourceable.Count > 0)
-        {
-            Console.WriteLine($"\n── Still unavailable ({unsourceable.Count}/{cards.Count}) ──");
-            foreach (var card in unsourceable)
+            if (unsourceable.Count > 0)
             {
-                Console.WriteLine($"  1 {card}");
+                Console.WriteLine($"\n── Still unavailable ({unsourceable.Count}/{cards.Count}) ──");
+                foreach (var card in unsourceable)
+                {
+                    Console.WriteLine($"  1 {card}");
+                }
             }
         }
+    }
+
+    private static bool IsBetterOrderSolution(OrderSolution candidate, OrderSolution existing)
+    {
+        return candidate.Coverage > existing.Coverage ||
+            (candidate.Coverage == existing.Coverage && candidate.TotalCost < existing.TotalCost);
+    }
+
+    private static int CountVendors(IReadOnlyDictionary<string, string> config)
+    {
+        return config.Values.ToHashSet(StringComparer.Ordinal).Count;
+    }
+
+    private static string BuildSolutionSignature(IReadOnlyDictionary<string, string> config)
+    {
+        return string.Join(
+            "\n",
+            config
+                .OrderBy(kvp => kvp.Key, StringComparer.Ordinal)
+                .Select(kvp => $"{kvp.Key}={kvp.Value}"));
     }
 
     private static void DrawOrderTable(
@@ -591,6 +633,16 @@ internal static class Program
                     options.Open = true;
                     break;
 
+                case "--return-count":
+                case "--returncount":
+                    if (!ReadIntValue(args, ref i, out var returnCount, out error))
+                    {
+                        return false;
+                    }
+
+                    options.ReturnCount = returnCount;
+                    break;
+
                 case "--ignore-vendor":
                     var foundVendor = false;
                     while (i + 1 < args.Length && !args[i + 1].StartsWith("--", StringComparison.Ordinal))
@@ -644,15 +696,38 @@ internal static class Program
         return true;
     }
 
+    private static bool ReadIntValue(string[] args, ref int index, out int value, out string? error)
+    {
+        value = 0;
+        error = null;
+
+        if (index + 1 >= args.Length)
+        {
+            error = $"{args[index]} requires a positive integer value.";
+            return false;
+        }
+
+        var rawValue = args[++index];
+        if (!int.TryParse(rawValue, NumberStyles.Integer, CultureInfo.InvariantCulture, out var parsed) || parsed <= 0)
+        {
+            error = $"{args[index - 1]} value '{rawValue}' is not a positive integer.";
+            return false;
+        }
+
+        value = parsed;
+        return true;
+    }
+
     private static void PrintUsage()
     {
         Console.WriteLine("""
 Usage:
-  dotnet run --project mtg-search-au -- [--filter-price AMOUNT] [--filter-diff AMOUNT] [--open] [--ignore-vendor ck gg mm ebay]
+  dotnet run --project mtg-search-au -- [--filter-price AMOUNT] [--filter-diff AMOUNT] [--return-count COUNT] [--open] [--ignore-vendor ck gg mm ebay]
 
 Examples:
   dotnet run --project mtg-search-au
   dotnet run --project mtg-search-au -- --filter-price 5
+  dotnet run --project mtg-search-au -- --return-count 3
   dotnet run --project mtg-search-au -- --ignore-vendor ck ebay
 """);
     }
@@ -664,6 +739,7 @@ internal sealed class Options
 
     public double? FilterPrice { get; set; }
     public double? FilterDiff { get; set; }
+    public int ReturnCount { get; set; } = 1;
     public bool Open { get; set; }
     public bool ShowHelp { get; set; }
     public HashSet<string> IgnoreVendors { get; } = new(StringComparer.Ordinal);

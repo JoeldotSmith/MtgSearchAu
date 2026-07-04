@@ -17,6 +17,7 @@ The app reads `decklist.txt` from the current directory or a nearby parent direc
 ```bash
 dotnet run --project mtg-search-au -- --filter-price 5
 dotnet run --project mtg-search-au -- --filter-diff 1.50
+dotnet run --project mtg-search-au -- --return-count 3
 dotnet run --project mtg-search-au -- --ignore-vendor ck gg
 dotnet run --project mtg-search-au -- --open
 ```
