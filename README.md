@@ -1,10 +1,10 @@
 # MTG Decklist Price Search - .NET
 
-C#/.NET 8 port of the Python command-line app in the repository root.
+C#/.NET 8 port of the Python command-line app.
 
 ## Run
 
-From the repository root:
+From the root:
 
 ```bash
 dotnet run --project mtg-search-au
@@ -25,9 +25,8 @@ Valid `--ignore-vendor` values are `ck`, `gg`, `mm`, and `ebay`.
 
 ## eBay Credentials
 
-The Python app has eBay credentials in source. This port does not duplicate those credentials.
-
 To enable eBay lookups, store them with .NET user secrets:
+Note you will need ebay developer account
 
 ```bash
 dotnet user-secrets set "Ebay:ClientId" "your-client-id" --project mtg-search-au
