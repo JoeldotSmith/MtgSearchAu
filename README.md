@@ -1,6 +1,6 @@
 # MTG Decklist Price Search - .NET
 
-C#/.NET 8 port of the Python command-line app.
+C#/.NET 10 port of the Python command-line app.
 
 ## Run
 
